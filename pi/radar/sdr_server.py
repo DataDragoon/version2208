@@ -211,7 +211,12 @@ class SDRServer:
 
     def _sfcw_callback(self, data):
         if isinstance(data, dict) and data.get('type') == 'range_profile':
-            data['_timing_queue_timestamp_us'] = time.time_ns() // 1000
+            queue_timestamp_us = time.time_ns() // 1000
+            data['_timing_queue_timestamp_us'] = queue_timestamp_us
+            _print_and_log_timing(
+                '[sfcw timing] action=range_profile_queued '
+                f'action_timestamp_us={queue_timestamp_us}'
+            )
         try:
             self.sfcw_queue.put_nowait(data)
         except asyncio.QueueFull:
@@ -274,10 +279,9 @@ class SDRServer:
             if isinstance(data, dict) and data.get('type') == 'range_profile':
                 send_timestamp_us = time.time_ns() // 1000
                 _print_and_log_timing(
-                    '[sfcw timing] groundstation '
-                    f'queue_timestamp_us={queue_timestamp_us} '
-                    f'send_timestamp_us={send_timestamp_us} '
-                    f'queue_to_send_us={send_timestamp_us - queue_timestamp_us if queue_timestamp_us else None}'
+                    '[sfcw timing] action=range_profile_sent_to_groundstation '
+                    f'action_timestamp_us={send_timestamp_us} '
+                    f'time_since_queue_us={send_timestamp_us - queue_timestamp_us if queue_timestamp_us else None}'
                 )
 
             if not self.sfcw.running:
