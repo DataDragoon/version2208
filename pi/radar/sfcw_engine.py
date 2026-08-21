@@ -31,16 +31,6 @@ def _print_and_log_timing(message):
         print(f'[sfcw timing] Could not write log: {exc}')
 
 
-def _timing_action_line(step, action, timestamp_us, elapsed_us, **fields):
-    details = ' '.join(f'{name}={value}' for name, value in fields.items())
-    return (
-        f'[sfcw timing] step={step} action={action} '
-        f'action_timestamp_us={timestamp_us} '
-        f'time_since_previous_action_us={elapsed_us}'
-        f'{" " + details if details else ""}'
-    )
-
-
 class SFCWEngine:
     def __init__(self, driver: BladeRFDriver):
         self.driver = driver
@@ -427,7 +417,6 @@ class SFCWEngine:
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
-        self._rx_packet_times = {}
         n = 4096
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
@@ -480,13 +469,10 @@ class SFCWEngine:
         with self._rx_cond:
             self._rx_latest = (rx1_iq, rx2_iq)
             self._rx_seq += 1
-            self._rx_packet_times[self._rx_seq] = (time.perf_counter_ns(), time.time_ns() // 1000)
-            if len(self._rx_packet_times) > 256:
-                del self._rx_packet_times[min(self._rx_packet_times)]
             self._rx_cond.notify_all()
 
     def _perform_sweep(self):
-        sweep_start_ns = time.perf_counter_ns()
+        _print_and_log_timing('[sfcw timing] ==================== SWEEP START ====================')
         with self._lock:
             start = self.start_freq
             stop = self.stop_freq
@@ -494,6 +480,12 @@ class SFCWEngine:
             num_buffers = self.num_buffers
 
         num_steps = int((stop - start) / step) + 1
+        _print_and_log_timing(
+            '[sfcw timing] sweep_info '
+            f'num_steps={num_steps} first_step=0 last_step={num_steps - 1} '
+            f'start_frequency_hz={int(start)} stop_frequency_hz={int(stop)} '
+            f'step_size_hz={int(step)}'
+        )
         freqs = np.linspace(start, stop, num_steps).astype(np.int64)
 
         def progress(i):
@@ -512,24 +504,8 @@ class SFCWEngine:
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
-        processing_start_ns = time.perf_counter_ns()
-        _print_and_log_timing(_timing_action_line(
-            'sweep', 'range_profile_processing_started', time.time_ns() // 1000, 0,
-        ))
         result = self._process_h_cal(h_cal)
-        processing_end_ns = time.perf_counter_ns()
-        _print_and_log_timing(_timing_action_line(
-            'sweep', 'range_profile_processing_finished', time.time_ns() // 1000,
-            (processing_end_ns - processing_start_ns) // 1000,
-            range_profile_processing_duration_us=(processing_end_ns - processing_start_ns) // 1000,
-        ))
-        _print_and_log_timing(
-            '[sfcw timing] sweep '
-            f'iq_demodulation_us={sum(t["iq_demodulation_duration_us"] for t in self._last_step_timings)} '
-            f'reference_calibration_us={self._last_calibration_duration_us} '
-            f'range_profile_processing_us={(processing_end_ns - processing_start_ns) // 1000} '
-            f'engine_sweep_to_result_us={(processing_end_ns - sweep_start_ns) // 1000}'
-        )
+        _print_and_log_timing('[sfcw timing] ===================== SWEEP END =====================')
         return result
 
     def _perform_sweep_raw(self):
@@ -565,6 +541,13 @@ class SFCWEngine:
         settle_count = 7 if use_qt else 2
         total_wait = settle_count + num_buffers
 
+        _print_and_log_timing(
+            '[sfcw timing] capture_info '
+            f'settling_packets={settle_count} capture_packets={num_buffers} '
+            f'total_packets_waited_per_step={total_wait} '
+            f'used_for_iq_calculation=last_packet_only'
+        )
+
         qt_rx = self._qt_profiles_rx
         qt_tx = self._qt_profiles_tx
         ref_tone_scaled = self._ref_tone_scaled
@@ -572,35 +555,22 @@ class SFCWEngine:
         stop_event = self._stop_event
 
         dropped_steps = 0
-        step_timings = []
 
         for i in range(num_steps):
             if stop_event.is_set():
                 return None, 0
 
             f = int(freqs[i])
-            command_start_ns = time.perf_counter_ns()
-            command_timestamp_us = time.time_ns() // 1000
-            previous_action_ns = command_start_ns
-            if i in TIMING_STEPS:
-                _print_and_log_timing(_timing_action_line(
-                    i, 'command_sent_to_bladerf', command_timestamp_us, 0,
-                    frequency_hz=f,
-                ))
+            _print_and_log_timing(
+                '[sfcw timing] -------------------- '
+                f'STEP {i} START frequency_hz={f} --------------------'
+            )
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
                 libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
-            command_end_ns = time.perf_counter_ns()
-            if i in TIMING_STEPS:
-                _print_and_log_timing(_timing_action_line(
-                    i, 'bladerf_command_returned', time.time_ns() // 1000,
-                    (command_end_ns - previous_action_ns) // 1000,
-                    command_duration_us=(command_end_ns - command_start_ns) // 1000,
-                ))
-                previous_action_ns = command_end_ns
 
             with rx_cond:
                 post_retune_seq = self._rx_seq
@@ -609,26 +579,7 @@ class SFCWEngine:
                     if not rx_cond.wait(timeout=1.0):
                         break
                 latest = self._rx_latest
-                packet_times = [
-                    self._rx_packet_times.get(post_retune_seq + packet_number)
-                    for packet_number in range(1, total_wait + 1)
-                ]
 
-            demod_start_ns = time.perf_counter_ns()
-            if i in TIMING_STEPS:
-                for packet_number, packet_time in enumerate(packet_times, start=1):
-                    if packet_time:
-                        _print_and_log_timing(_timing_action_line(
-                            i, f'packet_{packet_number}_received', packet_time[1],
-                            (packet_time[0] - previous_action_ns) // 1000,
-                            command_sent_to_packet_received_us=(packet_time[0] - command_start_ns) // 1000,
-                        ))
-                        previous_action_ns = packet_time[0]
-                _print_and_log_timing(_timing_action_line(
-                    i, 'iq_demodulation_started', time.time_ns() // 1000,
-                    (demod_start_ns - previous_action_ns) // 1000,
-                ))
-                previous_action_ns = demod_start_ns
             if latest is not None:
                 rx1_buf = latest[0]
                 rx2_buf = latest[1]
@@ -638,47 +589,20 @@ class SFCWEngine:
                 h_reference[i] = np.mean((ref_arr[0::2] + 1j * ref_arr[1::2]) * ref_tone_scaled)
             else:
                 dropped_steps += 1
-            demod_end_ns = time.perf_counter_ns()
-            if i in TIMING_STEPS:
-                _print_and_log_timing(_timing_action_line(
-                    i, 'iq_demodulation_finished', time.time_ns() // 1000,
-                    (demod_end_ns - previous_action_ns) // 1000,
-                    iq_demodulation_duration_us=(demod_end_ns - demod_start_ns) // 1000,
-                ))
-                previous_action_ns = demod_end_ns
-
-            timing = {
-                'step': i,
-                'frequency_hz': f,
-                'command_timestamp_us': command_timestamp_us,
-                'command_duration_us': (command_end_ns - command_start_ns) // 1000,
-                'iq_demodulation_duration_us': (demod_end_ns - demod_start_ns) // 1000,
-            }
-            step_timings.append(timing)
-
-            if i in TIMING_STEPS:
-                _print_and_log_timing(_timing_action_line(
-                    i, 'step_capture_complete', time.time_ns() // 1000,
-                    (demod_end_ns - previous_action_ns) // 1000,
-                    command_to_demodulation_complete_us=(demod_end_ns - command_start_ns) // 1000,
-                ))
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
 
-        calibration_start_ns = time.perf_counter_ns()
+            _print_and_log_timing(
+                '[sfcw timing] --------------------- '
+                f'STEP {i} END ---------------------'
+            )
+
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
-        self._last_calibration_duration_us = (time.perf_counter_ns() - calibration_start_ns) // 1000
-        _print_and_log_timing(_timing_action_line(
-            'sweep', 'reference_calibration_finished', time.time_ns() // 1000,
-            self._last_calibration_duration_us,
-            reference_calibration_duration_us=self._last_calibration_duration_us,
-        ))
 
-        self._last_step_timings = step_timings
         return h_cal, dropped_steps
 
     def _process_h_cal(self, h_cal):
