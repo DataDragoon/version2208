@@ -10,6 +10,7 @@ eliminates random PLL phase offsets between TX and RX synthesizers.
 
 import threading
 import time
+import os
 import numpy as np
 
 from bladerf_driver import BladeRFDriver
@@ -17,6 +18,17 @@ from bladerf._bladerf import ffi, libbladeRF
 import bladerf
 
 SPEED_OF_LIGHT = 299_792_458
+TIMING_LOG_PATH = os.path.join(os.path.dirname(__file__), 'sfcw_timing.log')
+TIMING_STEPS = {0, 1, 50, 150}
+
+
+def _print_and_log_timing(message):
+    print(message)
+    try:
+        with open(TIMING_LOG_PATH, 'a', encoding='ascii') as log_file:
+            log_file.write(message + '\n')
+    except OSError as exc:
+        print(f'[sfcw timing] Could not write log: {exc}')
 
 
 class SFCWEngine:
@@ -49,6 +61,8 @@ class SFCWEngine:
         self._qt_params = None
         self._use_quick_tune = True
         self._freq_grid_dirty = False
+        self._last_step_timings = []
+        self._last_calibration_duration_us = 0
 
     @property
     def num_steps(self):
@@ -403,6 +417,7 @@ class SFCWEngine:
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
+        self._rx_packet_times = {}
         n = 4096
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
@@ -455,9 +470,13 @@ class SFCWEngine:
         with self._rx_cond:
             self._rx_latest = (rx1_iq, rx2_iq)
             self._rx_seq += 1
+            self._rx_packet_times[self._rx_seq] = (time.perf_counter_ns(), time.time_ns() // 1000)
+            if len(self._rx_packet_times) > 256:
+                del self._rx_packet_times[min(self._rx_packet_times)]
             self._rx_cond.notify_all()
 
     def _perform_sweep(self):
+        sweep_start_ns = time.perf_counter_ns()
         with self._lock:
             start = self.start_freq
             stop = self.stop_freq
@@ -483,7 +502,17 @@ class SFCWEngine:
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
-        return self._process_h_cal(h_cal)
+        processing_start_ns = time.perf_counter_ns()
+        result = self._process_h_cal(h_cal)
+        processing_end_ns = time.perf_counter_ns()
+        _print_and_log_timing(
+            '[sfcw timing] sweep '
+            f'iq_demodulation_us={sum(t["iq_demodulation_duration_us"] for t in self._last_step_timings)} '
+            f'reference_calibration_us={self._last_calibration_duration_us} '
+            f'range_profile_processing_us={(processing_end_ns - processing_start_ns) // 1000} '
+            f'engine_sweep_to_result_us={(processing_end_ns - sweep_start_ns) // 1000}'
+        )
+        return result
 
     def _perform_sweep_raw(self):
         """Like _perform_sweep but returns raw h_cal array for averaging."""
@@ -525,18 +554,22 @@ class SFCWEngine:
         stop_event = self._stop_event
 
         dropped_steps = 0
+        step_timings = []
 
         for i in range(num_steps):
             if stop_event.is_set():
                 return None, 0
 
             f = int(freqs[i])
+            command_start_ns = time.perf_counter_ns()
+            command_timestamp_us = time.time_ns() // 1000
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
                 libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
+            command_end_ns = time.perf_counter_ns()
 
             with rx_cond:
                 post_retune_seq = self._rx_seq
@@ -545,7 +578,12 @@ class SFCWEngine:
                     if not rx_cond.wait(timeout=1.0):
                         break
                 latest = self._rx_latest
+                packet_times = [
+                    self._rx_packet_times.get(post_retune_seq + packet_number)
+                    for packet_number in range(1, total_wait + 1)
+                ]
 
+            demod_start_ns = time.perf_counter_ns()
             if latest is not None:
                 rx1_buf = latest[0]
                 rx2_buf = latest[1]
@@ -555,15 +593,50 @@ class SFCWEngine:
                 h_reference[i] = np.mean((ref_arr[0::2] + 1j * ref_arr[1::2]) * ref_tone_scaled)
             else:
                 dropped_steps += 1
+            demod_end_ns = time.perf_counter_ns()
+
+            timing = {
+                'step': i,
+                'frequency_hz': f,
+                'command_timestamp_us': command_timestamp_us,
+                'command_duration_us': (command_end_ns - command_start_ns) // 1000,
+                'iq_demodulation_duration_us': (demod_end_ns - demod_start_ns) // 1000,
+            }
+            step_timings.append(timing)
+
+            if i in TIMING_STEPS:
+                _print_and_log_timing(
+                    '[sfcw timing] '
+                    f'step={i} frequency_hz={f} '
+                    f'command_timestamp_us={command_timestamp_us} '
+                    f'command_duration_us={timing["command_duration_us"]} '
+                    f'iq_demodulation_us={timing["iq_demodulation_duration_us"]}'
+                )
+                previous_packet_time = None
+                for packet_number, packet_time in enumerate(packet_times, start=1):
+                    _print_and_log_timing(
+                        '[sfcw timing] '
+                        f'step={i} packet={packet_number} '
+                        f'packet_timestamp_us={packet_time[1] if packet_time else None} '
+                        f'command_to_packet_us='
+                        f'{((packet_time[0] - command_start_ns) // 1000) if packet_time else None} '
+                        f'packet_interval_us='
+                        f'{((packet_time[0] - previous_packet_time[0]) // 1000) if packet_time and previous_packet_time else None}'
+                    )
+                    if packet_time:
+                        previous_packet_time = packet_time
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
 
+        calibration_start_ns = time.perf_counter_ns()
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
+        self._last_calibration_duration_us = (time.perf_counter_ns() - calibration_start_ns) // 1000
 
+        self._last_step_timings = step_timings
         return h_cal, dropped_steps
 
     def _process_h_cal(self, h_cal):
