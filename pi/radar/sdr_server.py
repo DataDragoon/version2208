@@ -3,11 +3,12 @@
 import asyncio
 import json
 import sys
+import time
 import numpy as np
 import websockets
 
 from bladerf_driver import BladeRFDriver
-from sfcw_engine import SFCWEngine
+from sfcw_engine import SFCWEngine, _print_and_log_timing
 
 SCALE = 2047
 PORT = 9003
@@ -209,6 +210,8 @@ class SDRServer:
         return params
 
     def _sfcw_callback(self, data):
+        if isinstance(data, dict) and data.get('type') == 'range_profile':
+            data.setdefault('_timing_us', {})['groundstation_queue_timestamp_us'] = time.time_ns() // 1000
         try:
             self.sfcw_queue.put_nowait(data)
         except asyncio.QueueFull:
@@ -239,6 +242,19 @@ class SDRServer:
             elif isinstance(data, dict) and data.get('type') == 'progress':
                 msg = json.dumps({'type': 'sfcw_progress', 'step': data['step'], 'total': data['total'], 'freq_mhz': round(data['freq_mhz'], 2)})
             elif isinstance(data, dict) and data.get('type') == 'range_profile':
+                timing = data.pop('_timing_us', {})
+                timing['groundstation_send_timestamp_us'] = time.time_ns() // 1000
+                queued_us = timing.get('groundstation_queue_timestamp_us')
+                if queued_us is not None:
+                    timing['groundstation_queue_to_send_duration_us'] = (
+                        timing['groundstation_send_timestamp_us'] - queued_us
+                    )
+                _print_and_log_timing(
+                    '[sfcw timing] groundstation: '
+                    f'queue_timestamp_us={queued_us} '
+                    f'send_timestamp_us={timing["groundstation_send_timestamp_us"]} '
+                    f'queue_to_send_us={timing.get("groundstation_queue_to_send_duration_us")}'
+                )
                 result_msg = {
                     'type': 'sfcw_result',
                     'distances': [round(d, 4) for d in data['distances']],
