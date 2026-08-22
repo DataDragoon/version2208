@@ -589,6 +589,12 @@ class SFCWEngine:
             f = int(freqs[i])
 
             # Send retune command to bladeRF
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} >>> SEND TO BLADERF",
+                           action="RX_retune+TX_retune",
+                           freq=f"{f/1e9:.3f}GHz",
+                           method="quick_tune" if use_qt else "full_tune")
+
             cmd_start = time.time()
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
@@ -599,12 +605,16 @@ class SFCWEngine:
             cmd_duration = time.time() - cmd_start
 
             if i in log_steps:
-                _log_timing(f"  Step {i:3d} CMD SENT",
-                           freq=f"{f/1e9:.3f}GHz",
-                           method="quick_tune" if use_qt else "full_tune",
+                _log_timing(f"  Step {i:3d} <<< USB ACK FROM BLADERF",
+                           status="retune_scheduled",
                            time=_format_duration(cmd_duration))
 
             # Wait for packets (settle + capture)
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} >>> WAITING FOR BLADERF",
+                           waiting_for=f"{total_wait}_IQ_packets",
+                           note=f"{settle_count}_settling+{num_buffers}_capture")
+
             wait_start = time.time()
             with rx_cond:
                 post_retune_seq = self._rx_seq
@@ -616,17 +626,22 @@ class SFCWEngine:
             wait_duration = time.time() - wait_start
 
             if i in log_steps:
-                _log_timing(f"  Step {i:3d} PACKETS RX",
-                           settle_pkts=settle_count,
-                           capture_pkts=num_buffers,
-                           total_pkts=total_wait,
+                samples_per_pkt = 4096
+                total_samples = total_wait * samples_per_pkt
+                _log_timing(f"  Step {i:3d} <<< RECEIVED FROM BLADERF",
+                           packets=total_wait,
+                           samples=f"{total_samples}_IQ_samples",
                            time=_format_duration(wait_duration))
 
             # Compute IQ at this frequency
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} >>> PROCESSING",
+                           operation="extract_IQ_via_ref_tone_mixing")
+
             compute_start = time.time()
             if latest is not None:
-                rx1_buf = latest[0]
-                rx2_buf = latest[1]
+                rx1_buf = latest[0]  # Antenna signal
+                rx2_buf = latest[1]  # Reference loopback
                 sig_arr = rx1_buf.astype(np.float64)
                 ref_arr = rx2_buf.astype(np.float64)
                 h_signal[i] = np.mean((sig_arr[0::2] + 1j * sig_arr[1::2]) * ref_tone_scaled)
@@ -638,9 +653,9 @@ class SFCWEngine:
             step_total = time.time() - step_start
 
             if i in log_steps:
-                _log_timing(f"  Step {i:3d} IQ COMPUTE",
-                           valid="yes" if latest else "NO_PACKET",
-                           compute=_format_duration(compute_duration),
+                _log_timing(f"  Step {i:3d} <<< STEP COMPLETE",
+                           iq_valid="yes" if latest else "NO_PACKET",
+                           compute_time=_format_duration(compute_duration),
                            step_total=_format_duration(step_total))
                 # Add blank line between steps for readability
                 if i < num_steps - 1:
