@@ -578,8 +578,8 @@ class SFCWEngine:
 
         dropped_steps = 0
 
-        # Log detailed timing for first, middle, 150th, and last steps
-        log_steps = {0, 1, 50, 150, num_steps // 2, num_steps - 1}
+        # Log detailed timing for first few, 50th, 150th, middle, and last steps
+        log_steps = {0, 1, 2, 3, 50, 150, num_steps // 2, num_steps - 1}
 
         for i in range(num_steps):
             if stop_event.is_set():
