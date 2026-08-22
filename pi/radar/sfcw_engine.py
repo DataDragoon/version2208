@@ -664,7 +664,9 @@ class SFCWEngine:
             if i in log_steps:
                 _log_timing(f"  Step {i:3d} <<< STEP COMPLETE",
                            iq_valid="yes" if latest else "NO_PACKET",
-                           compute_time=_format_duration(compute_duration),
+                           usb_ack=_format_duration(cmd_duration),
+                           pkt_wait=_format_duration(wait_duration),
+                           iq_compute=_format_duration(compute_duration),
                            step_total=_format_duration(step_total))
                 # Add blank line between steps for readability
                 if i < num_steps - 1:
