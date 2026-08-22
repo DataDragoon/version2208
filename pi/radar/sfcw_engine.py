@@ -22,14 +22,14 @@ SPEED_OF_LIGHT = 299_792_458
 
 def _log_timing(event, **details):
     """Log timing events in human-readable format."""
-    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')  # Microsecond precision
     detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
     print(f"[{timestamp}] SFCW | {event:<30} {detail_str}", flush=True)
 
 
 def _log_separator(char='─'):
     """Print a visual separator line."""
-    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')  # Microsecond precision
     print(f"[{timestamp}] SFCW | {char * 70}", flush=True)
 
 
