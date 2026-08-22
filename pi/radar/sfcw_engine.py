@@ -24,13 +24,13 @@ def _log_timing(event, **details):
     """Log timing events in human-readable format."""
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
     detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
-    print(f"[{timestamp}] SFCW | {event:<30} {detail_str}")
+    print(f"[{timestamp}] SFCW | {event:<30} {detail_str}", flush=True)
 
 
 def _log_separator(char='─'):
     """Print a visual separator line."""
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-    print(f"[{timestamp}] SFCW | {char * 70}")
+    print(f"[{timestamp}] SFCW | {char * 70}", flush=True)
 
 
 def _format_duration(seconds):
@@ -644,7 +644,7 @@ class SFCWEngine:
                            step_total=_format_duration(step_total))
                 # Add blank line between steps for readability
                 if i < num_steps - 1:
-                    print()
+                    print(flush=True)
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)

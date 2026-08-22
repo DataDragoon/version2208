@@ -16,13 +16,13 @@ def _log_timing(event, **details):
     """Log timing events in human-readable format."""
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
     detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
-    print(f"[{timestamp}] SDR  | {event:<30} {detail_str}")
+    print(f"[{timestamp}] SDR  | {event:<30} {detail_str}", flush=True)
 
 
 def _log_separator(char='─'):
     """Print a visual separator line."""
     timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-    print(f"[{timestamp}] SDR  | {char * 70}")
+    print(f"[{timestamp}] SDR  | {char * 70}", flush=True)
 
 
 SCALE = 2047
@@ -321,7 +321,7 @@ class SDRServer:
                            clients=len(self.clients),
                            size_kb=f"{msg_size/1024:.1f}",
                            time_ms=f"{send_time*1000:.1f}")
-                print()  # Blank line after transmission
+                print(flush=True)  # Blank line after transmission
 
             if not self.sfcw.running:
                 await self._broadcast_sfcw_status()
