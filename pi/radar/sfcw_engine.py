@@ -616,22 +616,31 @@ class SFCWEngine:
                            note=f"{settle_count}_settling+{num_buffers}_capture")
 
             wait_start = time.time()
+            last_pkt_time = wait_start
             with rx_cond:
                 post_retune_seq = self._rx_seq
                 target_seq = post_retune_seq + total_wait
+                pkt_num = 1
                 while self._rx_seq < target_seq:
                     if not rx_cond.wait(timeout=1.0):
                         break
+                    # Log each packet arrival
+                    if i in log_steps and self._rx_seq <= target_seq:
+                        now = time.time()
+                        pkt_delta = now - last_pkt_time
+                        pkt_type = "settling" if pkt_num <= settle_count else "CAPTURE"
+                        _log_timing(f"  Step {i:3d}      packet {pkt_num:2d}/{total_wait}",
+                                   type=pkt_type,
+                                   dt=_format_duration(pkt_delta))
+                        last_pkt_time = now
+                        pkt_num += 1
                 latest = self._rx_latest
             wait_duration = time.time() - wait_start
 
             if i in log_steps:
-                samples_per_pkt = 4096
-                total_samples = total_wait * samples_per_pkt
-                _log_timing(f"  Step {i:3d} <<< RECEIVED FROM BLADERF",
-                           packets=total_wait,
-                           samples=f"{total_samples}_IQ_samples",
-                           time=_format_duration(wait_duration))
+                _log_timing(f"  Step {i:3d} <<< ALL PACKETS RECEIVED",
+                           total_time=_format_duration(wait_duration),
+                           using_packet=f"{total_wait}_for_IQ_calc")
 
             # Compute IQ at this frequency
             if i in log_steps:
