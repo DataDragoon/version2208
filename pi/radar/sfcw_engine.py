@@ -27,6 +27,12 @@ def _log_timing(event, **details):
     print(f"[{timestamp}] SFCW | {event:<30} {detail_str}")
 
 
+def _log_separator(char='─'):
+    """Print a visual separator line."""
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    print(f"[{timestamp}] SFCW | {char * 70}")
+
+
 def _format_duration(seconds):
     """Format duration in human-readable way."""
     if seconds < 0.001:
@@ -487,10 +493,12 @@ class SFCWEngine:
         num_steps = int((stop - start) / step) + 1
         freqs = np.linspace(start, stop, num_steps).astype(np.int64)
 
+        _log_separator('═')
         _log_timing("SWEEP START",
                    steps=num_steps,
                    freq_range=f"{start/1e9:.2f}-{stop/1e9:.2f}GHz",
                    step_size=f"{step/1e6:.1f}MHz")
+        _log_separator('─')
 
         def progress(i):
             if self._callback and i % 10 == 0:
@@ -511,6 +519,7 @@ class SFCWEngine:
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
+        _log_separator('─')
         _log_timing("CAPTURE COMPLETE",
                    duration=_format_duration(capture_duration),
                    dropped=dropped_steps)
@@ -524,6 +533,7 @@ class SFCWEngine:
                    total=_format_duration(total_duration),
                    capture=_format_duration(capture_duration),
                    postproc=_format_duration(postproc_duration))
+        _log_separator('═')
 
         return result
 
@@ -568,8 +578,8 @@ class SFCWEngine:
 
         dropped_steps = 0
 
-        # Log detailed timing for first, middle, and last steps
-        log_steps = {0, 1, num_steps // 2, num_steps - 1}
+        # Log detailed timing for first, middle, 150th, and last steps
+        log_steps = {0, 1, 50, 150, num_steps // 2, num_steps - 1}
 
         for i in range(num_steps):
             if stop_event.is_set():
@@ -632,11 +642,15 @@ class SFCWEngine:
                            valid="yes" if latest else "NO_PACKET",
                            compute=_format_duration(compute_duration),
                            step_total=_format_duration(step_total))
+                # Add blank line between steps for readability
+                if i < num_steps - 1:
+                    print()
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
 
         # Reference division (phase correction)
+        _log_separator('─')
         _log_timing("REF DIVISION START", valid_steps=f"{num_steps-dropped_steps}/{num_steps}")
         ref_start = time.time()
         ref_mag = np.abs(h_reference)
@@ -653,6 +667,7 @@ class SFCWEngine:
         stop = self.stop_freq
         step = self.step_size
 
+        _log_separator('─')
         _log_timing("POST-PROC START", operation="phase_unwrap")
         t1 = time.time()
         phase_raw = np.angle(h_cal)
