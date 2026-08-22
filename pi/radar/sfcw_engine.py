@@ -10,25 +10,31 @@ eliminates random PLL phase offsets between TX and RX synthesizers.
 
 import threading
 import time
-import os
 import numpy as np
+from datetime import datetime
 
 from bladerf_driver import BladeRFDriver
 from bladerf._bladerf import ffi, libbladeRF
 import bladerf
 
 SPEED_OF_LIGHT = 299_792_458
-TIMING_LOG_PATH = os.path.join(os.path.dirname(__file__), 'sfcw_timing.log')
-TIMING_STEPS = {0, 1, 50, 150}
 
 
-def _print_and_log_timing(message):
-    print(message)
-    try:
-        with open(TIMING_LOG_PATH, 'a', encoding='ascii') as log_file:
-            log_file.write(message + '\n')
-    except OSError as exc:
-        print(f'[sfcw timing] Could not write log: {exc}')
+def _log_timing(event, **details):
+    """Log timing events in human-readable format."""
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
+    print(f"[{timestamp}] SFCW | {event:<30} {detail_str}")
+
+
+def _format_duration(seconds):
+    """Format duration in human-readable way."""
+    if seconds < 0.001:
+        return f"{seconds*1000000:.0f}µs"
+    elif seconds < 1:
+        return f"{seconds*1000:.1f}ms"
+    else:
+        return f"{seconds:.3f}s"
 
 
 class SFCWEngine:
@@ -61,7 +67,6 @@ class SFCWEngine:
         self._qt_params = None
         self._use_quick_tune = True
         self._freq_grid_dirty = False
-        self._last_step_timings = []
         self._last_calibration_duration_us = 0
 
     @property
@@ -472,7 +477,7 @@ class SFCWEngine:
             self._rx_cond.notify_all()
 
     def _perform_sweep(self):
-        _print_and_log_timing('[sfcw timing] ==================== SWEEP START ====================')
+        sweep_start = time.time()
         with self._lock:
             start = self.start_freq
             stop = self.stop_freq
@@ -480,13 +485,12 @@ class SFCWEngine:
             num_buffers = self.num_buffers
 
         num_steps = int((stop - start) / step) + 1
-        _print_and_log_timing(
-            '[sfcw timing] sweep_info '
-            f'num_steps={num_steps} first_step=0 last_step={num_steps - 1} '
-            f'start_frequency_hz={int(start)} stop_frequency_hz={int(stop)} '
-            f'step_size_hz={int(step)}'
-        )
         freqs = np.linspace(start, stop, num_steps).astype(np.int64)
+
+        _log_timing("SWEEP START",
+                   steps=num_steps,
+                   freq_range=f"{start/1e9:.2f}-{stop/1e9:.2f}GHz",
+                   step_size=f"{step/1e6:.1f}MHz")
 
         def progress(i):
             if self._callback and i % 10 == 0:
@@ -497,15 +501,30 @@ class SFCWEngine:
                     'freq_mhz': freqs[i] / 1e6,
                 })
 
+        capture_start = time.time()
         h_cal, dropped_steps = self._sweep_core(num_steps, freqs, num_buffers, progress)
+        capture_duration = time.time() - capture_start
+
         if h_cal is None:
             return None
 
         if dropped_steps > 0:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
+        _log_timing("CAPTURE COMPLETE",
+                   duration=_format_duration(capture_duration),
+                   dropped=dropped_steps)
+
+        postproc_start = time.time()
         result = self._process_h_cal(h_cal)
-        _print_and_log_timing('[sfcw timing] ===================== SWEEP END =====================')
+        postproc_duration = time.time() - postproc_start
+
+        total_duration = time.time() - sweep_start
+        _log_timing("SWEEP END",
+                   total=_format_duration(total_duration),
+                   capture=_format_duration(capture_duration),
+                   postproc=_format_duration(postproc_duration))
+
         return result
 
     def _perform_sweep_raw(self):
@@ -541,13 +560,6 @@ class SFCWEngine:
         settle_count = 7 if use_qt else 2
         total_wait = settle_count + num_buffers
 
-        _print_and_log_timing(
-            '[sfcw timing] capture_info '
-            f'settling_packets={settle_count} capture_packets={num_buffers} '
-            f'total_packets_waited_per_step={total_wait} '
-            f'used_for_iq_calculation=last_packet_only'
-        )
-
         qt_rx = self._qt_profiles_rx
         qt_tx = self._qt_profiles_tx
         ref_tone_scaled = self._ref_tone_scaled
@@ -556,22 +568,34 @@ class SFCWEngine:
 
         dropped_steps = 0
 
+        # Log detailed timing for first, middle, and last steps
+        log_steps = {0, 1, num_steps // 2, num_steps - 1}
+
         for i in range(num_steps):
             if stop_event.is_set():
                 return None, 0
 
+            step_start = time.time()
             f = int(freqs[i])
-            _print_and_log_timing(
-                '[sfcw timing] -------------------- '
-                f'STEP {i} START frequency_hz={f} --------------------'
-            )
+
+            # Send retune command to bladeRF
+            cmd_start = time.time()
             if use_qt:
                 libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
                 libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
+            cmd_duration = time.time() - cmd_start
 
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} CMD SENT",
+                           freq=f"{f/1e9:.3f}GHz",
+                           method="quick_tune" if use_qt else "full_tune",
+                           time=_format_duration(cmd_duration))
+
+            # Wait for packets (settle + capture)
+            wait_start = time.time()
             with rx_cond:
                 post_retune_seq = self._rx_seq
                 target_seq = post_retune_seq + total_wait
@@ -579,7 +603,17 @@ class SFCWEngine:
                     if not rx_cond.wait(timeout=1.0):
                         break
                 latest = self._rx_latest
+            wait_duration = time.time() - wait_start
 
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} PACKETS RX",
+                           settle_pkts=settle_count,
+                           capture_pkts=num_buffers,
+                           total_pkts=total_wait,
+                           time=_format_duration(wait_duration))
+
+            # Compute IQ at this frequency
+            compute_start = time.time()
             if latest is not None:
                 rx1_buf = latest[0]
                 rx2_buf = latest[1]
@@ -589,19 +623,27 @@ class SFCWEngine:
                 h_reference[i] = np.mean((ref_arr[0::2] + 1j * ref_arr[1::2]) * ref_tone_scaled)
             else:
                 dropped_steps += 1
+            compute_duration = time.time() - compute_start
+
+            step_total = time.time() - step_start
+
+            if i in log_steps:
+                _log_timing(f"  Step {i:3d} IQ COMPUTE",
+                           valid="yes" if latest else "NO_PACKET",
+                           compute=_format_duration(compute_duration),
+                           step_total=_format_duration(step_total))
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
 
-            _print_and_log_timing(
-                '[sfcw timing] --------------------- '
-                f'STEP {i} END ---------------------'
-            )
-
+        # Reference division (phase correction)
+        _log_timing("REF DIVISION START", valid_steps=f"{num_steps-dropped_steps}/{num_steps}")
+        ref_start = time.time()
         ref_mag = np.abs(h_reference)
         valid = ref_mag > 1e-10
         h_cal = np.zeros(num_steps, dtype=np.complex128)
         h_cal[valid] = h_signal[valid] / h_reference[valid]
+        _log_timing("REF DIVISION DONE", time=_format_duration(time.time() - ref_start))
 
         return h_cal, dropped_steps
 
@@ -611,18 +653,25 @@ class SFCWEngine:
         stop = self.stop_freq
         step = self.step_size
 
+        _log_timing("POST-PROC START", operation="phase_unwrap")
+        t1 = time.time()
         phase_raw = np.angle(h_cal)
         phase_unwrapped = np.unwrap(phase_raw)
         coeffs = np.polyfit(np.arange(num_steps), phase_unwrapped, 1)
         residuals = phase_unwrapped - np.polyval(coeffs, np.arange(num_steps))
         phase_std = float(np.std(residuals))
+        _log_timing("  Phase unwrap done", time=_format_duration(time.time() - t1))
 
+        _log_timing("  Starting IFFT", nfft=num_steps*4)
+        t2 = time.time()
         window = np.hanning(num_steps)
         h_windowed = h_cal * window
         nfft = num_steps * 4
         range_profile = np.fft.ifft(h_windowed, n=nfft)
         magnitude_db = 20 * np.log10(np.abs(range_profile) + 1e-12)
+        _log_timing("  IFFT done", time=_format_duration(time.time() - t2))
 
+        t3 = time.time()
         max_range = SPEED_OF_LIGHT / (2 * step)
         distances = np.arange(nfft) / nfft * max_range - self.range_offset
 
@@ -636,6 +685,7 @@ class SFCWEngine:
 
         h_cal_real = h_cal.real.tolist()
         h_cal_imag = h_cal.imag.tolist()
+        _log_timing("  Array formatting done", time=_format_duration(time.time() - t3))
 
         return {
             'type': 'range_profile',

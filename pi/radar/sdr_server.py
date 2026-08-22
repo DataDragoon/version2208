@@ -3,11 +3,20 @@
 import asyncio
 import json
 import sys
+import time
 import numpy as np
 import websockets
+from datetime import datetime
 
 from bladerf_driver import BladeRFDriver
 from sfcw_engine import SFCWEngine
+
+
+def _log_timing(event, **details):
+    """Log timing events in human-readable format."""
+    timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+    detail_str = ' '.join(f'{k}={v}' for k, v in details.items()) if details else ''
+    print(f"[{timestamp}] SDR  | {event:<30} {detail_str}")
 
 SCALE = 2047
 PORT = 9003
@@ -209,6 +218,22 @@ class SDRServer:
         return params
 
     def _sfcw_callback(self, data):
+        # Add timing info when result is received from SFCW engine
+        if isinstance(data, dict) and data.get('type') == 'range_profile':
+            engine_ts = data.get('timestamp', 0)
+            receive_ts = time.time()
+            delay_ms = (receive_ts - engine_ts) * 1000 if engine_ts else 0
+            _log_timing("RESULT RECEIVED",
+                       num_steps=data.get('num_steps', 0),
+                       queue_size=self.sfcw_queue.qsize(),
+                       delay_ms=f"{delay_ms:.1f}")
+        elif isinstance(data, dict) and data.get('type') == 'progress':
+            # Log occasional progress updates (every 10 steps)
+            if data.get('step', 0) % 10 == 0:
+                _log_timing("PROGRESS UPDATE",
+                           step=f"{data.get('step', 0)}/{data.get('total', 0)}",
+                           freq=f"{data.get('freq_mhz', 0):.1f}MHz")
+
         try:
             self.sfcw_queue.put_nowait(data)
         except asyncio.QueueFull:
@@ -232,13 +257,21 @@ class SDRServer:
             if not self.clients:
                 continue
 
+            msg_type = None
+            msg_size = 0
+
             if isinstance(data, dict) and 'error' in data:
                 msg = json.dumps({'type': 'sfcw_error', 'message': data['error']})
+                msg_type = "error"
             elif isinstance(data, dict) and data.get('type') == 'coherence_result':
                 msg = json.dumps(data)
+                msg_type = "coherence"
             elif isinstance(data, dict) and data.get('type') == 'progress':
                 msg = json.dumps({'type': 'sfcw_progress', 'step': data['step'], 'total': data['total'], 'freq_mhz': round(data['freq_mhz'], 2)})
+                msg_type = "progress"
+                # Don't log every progress update, too verbose
             elif isinstance(data, dict) and data.get('type') == 'range_profile':
+                serialize_start = time.time()
                 result_msg = {
                     'type': 'sfcw_result',
                     'distances': [round(d, 4) for d in data['distances']],
@@ -256,9 +289,16 @@ class SDRServer:
                 if 'phase_coherence' in data:
                     result_msg['phase_coherence'] = data['phase_coherence']
                 msg = json.dumps(result_msg)
+                serialize_time = time.time() - serialize_start
+                msg_size = len(msg)
+                msg_type = "range_profile"
+                _log_timing("SERIALIZE DONE",
+                           size_kb=f"{msg_size/1024:.1f}",
+                           time_ms=f"{serialize_time*1000:.1f}")
             else:
                 continue
 
+            send_start = time.time()
             dead = set()
             for client in self.clients:
                 try:
@@ -266,6 +306,14 @@ class SDRServer:
                 except websockets.ConnectionClosed:
                     dead.add(client)
             self.clients -= dead
+            send_time = time.time() - send_start
+
+            # Log send timing for result messages
+            if msg_type == "range_profile":
+                _log_timing("SENT TO GROUNDSTATION",
+                           clients=len(self.clients),
+                           size_kb=f"{msg_size/1024:.1f}",
+                           time_ms=f"{send_time*1000:.1f}")
 
             if not self.sfcw.running:
                 await self._broadcast_sfcw_status()
