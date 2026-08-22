@@ -602,7 +602,8 @@ class SFCWEngine:
             else:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
-            cmd_duration = time.time() - cmd_start
+            cmd_end = time.time()
+            cmd_duration = cmd_end - cmd_start
 
             if i in log_steps:
                 _log_timing(f"  Step {i:3d} <<< USB ACK FROM BLADERF",
@@ -617,6 +618,10 @@ class SFCWEngine:
 
             wait_start = time.time()
             last_pkt_time = wait_start
+
+            # Track overhead if logging this step
+            if i in log_steps:
+                overhead1 = wait_start - cmd_end  # Overhead between USB ACK and wait start
             with rx_cond:
                 post_retune_seq = self._rx_seq
                 target_seq = post_retune_seq + total_wait
@@ -635,7 +640,8 @@ class SFCWEngine:
                         last_pkt_time = now
                         pkt_num += 1
                 latest = self._rx_latest
-            wait_duration = time.time() - wait_start
+            wait_end = time.time()
+            wait_duration = wait_end - wait_start
 
             if i in log_steps:
                 _log_timing(f"  Step {i:3d} <<< ALL PACKETS RECEIVED",
@@ -648,6 +654,11 @@ class SFCWEngine:
                            operation="extract_IQ_via_ref_tone_mixing")
 
             compute_start = time.time()
+
+            # Track overhead if logging this step
+            if i in log_steps:
+                overhead2 = compute_start - wait_end  # Overhead between packet wait and compute start
+
             if latest is not None:
                 rx1_buf = latest[0]  # Antenna signal
                 rx2_buf = latest[1]  # Reference loopback
@@ -657,16 +668,22 @@ class SFCWEngine:
                 h_reference[i] = np.mean((ref_arr[0::2] + 1j * ref_arr[1::2]) * ref_tone_scaled)
             else:
                 dropped_steps += 1
-            compute_duration = time.time() - compute_start
+            compute_end = time.time()
+            compute_duration = compute_end - compute_start
 
-            step_total = time.time() - step_start
+            step_end = time.time()
+            step_total = step_end - step_start
 
             if i in log_steps:
+                overhead3 = step_end - compute_end  # Overhead after compute (final logging)
+                # Total overhead
+                overhead_total = overhead1 + overhead2 + overhead3
                 _log_timing(f"  Step {i:3d} <<< STEP COMPLETE",
                            iq_valid="yes" if latest else "NO_PACKET",
                            usb_ack=_format_duration(cmd_duration),
                            pkt_wait=_format_duration(wait_duration),
                            iq_compute=_format_duration(compute_duration),
+                           overhead=_format_duration(overhead_total),
                            step_total=_format_duration(step_total))
                 # Add blank line between steps for readability
                 if i < num_steps - 1:
